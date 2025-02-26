@@ -1,103 +1,85 @@
 pipeline {
-    environment {
-        SERVICE_ACCOUNT= credentials('service_account')    // secret file for the GCP credential JSON file. I set it manually in Jenkins credentials
-        PROJECT = credentials('project_id')
-        REPO_PATH= credentials("repo_path") // secret text for the repo path. I set it manually in Jenkins credentials
-        APP_NAME = "binarycalculatorwebapp"
-        IMAGE_TAG = "$REPO_PATH/$APP_NAME"
-        CLUSTER = credentials("cluster_name") // secret text for the cluster name. I set it manually in Jenkins credentials
-        CLUSTER_ZONE = credentials("cluster_zone") // secret text for the cluster zone. I set it manually in Jenkins credentials
-    }
-    agent{   // create a node under the name gcloud that running google/cloud-sdk:latest docker image 
+    agent {
         kubernetes {
-        label 'sample-app'
-        yaml """
+            label 'sample-app'
+            yaml """
             apiVersion: v1
             kind: Pod
             metadata:
-            labels: 
-              component: ci
+              labels: 
+                component: ci
             spec:
               containers:
-              # Use service account that can deploy to all namespaces
               - name: gcloud
-                image:  google/cloud-sdk:latest
+                image: google/cloud-sdk:latest
                 command:
                 - cat
                 tty: true
             """
         }
     }
-    tools{
+    tools {
         maven 'maven'
     }
+    environment {
+        APP_NAME = "binarycalculatorwebapp"
+        IMAGE_TAG = "${REPO_PATH}/${APP_NAME}"
+    }
     stages {
-        stage ('test') {
+        stage('Setup') {
+            steps {
+                withCredentials([
+                    file(credentialsId: 'service_account', variable: 'SERVICE_ACCOUNT'),
+                    string(credentialsId: 'project_id', variable: 'PROJECT'),
+                    string(credentialsId: 'repo_path', variable: 'REPO_PATH'),
+                    string(credentialsId: 'cluster_name', variable: 'CLUSTER'),
+                    string(credentialsId: 'cluster_zone', variable: 'CLUSTER_ZONE')
+                ]) {
+                    sh '''
+                        gcloud auth activate-service-account --key-file="${SERVICE_ACCOUNT}"
+                        gcloud config set project "${PROJECT}"
+                    '''
+                }
+            }
+        }
+        stage('Test') {
             steps {
                 sh 'mvn clean test -f ./BinaryCalculatorWebapp/pom.xml'
             }
         }
-        stage('build'){
-            steps{
-                sh 'mvn package -DskipTests -f ./BinaryCalculatorWebapp/ clean package'
+        stage('Build') {
+            steps {
+                sh 'mvn clean package -DskipTests -f ./BinaryCalculatorWebapp/pom.xml'
             }
         }
-        stage('containerize'){
-            steps{
-                container('gcloud') {   // within the gcloud container
-                    dir('BinaryCalculatorWebapp'){
-                        // set the credential for gcloud within the container
-                        sh 'gcloud auth activate-service-account --key-file $SERVICE_ACCOUNT'
-                        sh 'gcloud config set project $PROJECT'
-                        sh 'gcloud builds submit -t $IMAGE_TAG --suppress-logs'
-                    }
+        stage('Containerize') {
+            steps {
+                container('gcloud') {
+                    sh 'gcloud builds submit -t "${IMAGE_TAG}" --suppress-logs'
                 }
             }
         }
-        stage('deployment'){
-            steps{
+        stage('Deploy') {
+            steps {
                 container('gcloud') {
-                    dir('BinaryCalculatorWebapp'){
-                        // set the credential for gcloud and kubectl within the container
-                        sh 'gcloud auth activate-service-account --key-file $SERVICE_ACCOUNT'
-                        sh 'gcloud config set project $PROJECT'
-                        sh 'gcloud container clusters get-credentials $CLUSTER --region=$CLUSTER_ZONE'
-                        script{
-                            try{
-                                // delete it if a previous deployment exists
-                                sh 'kubectl delete deployment binarycalculator-deployment'
-                            }
-                            catch (Exception e){
-                                
-                            }
-                        }
-                        // create a new deployment
-                        sh 'kubectl create deployment binarycalculator-deployment --image $IMAGE_TAG --port=8080'
-
-                    }
+                    sh '''
+                        gcloud container clusters get-credentials "${CLUSTER}" --region="${CLUSTER_ZONE}"
+                        kubectl apply -f deployment.yaml
+                        kubectl set image deployment/binarycalculator-deployment binarycalculator="${IMAGE_TAG}"
+                    '''
                 }
             }
         }
-        stage('service'){
-            steps{
+        stage('Expose Service') {
+            steps {
                 container('gcloud') {
-                    dir('BinaryCalculatorWebapp'){
-                        // set the credential for gcloud and kubectl within the container
-                        sh 'gcloud auth activate-service-account --key-file $SERVICE_ACCOUNT'
-                        sh 'gcloud config set project $PROJECT'
-                        sh 'gcloud container clusters get-credentials $CLUSTER --region=$CLUSTER_ZONE'
-                        script{
-                            try{
-                                // create if it the service doesn't exist. No need to recreate it
-                                sh 'kubectl expose deployment binarycalculator-deployment --type=LoadBalancer --name=binarycalculator-service'
-                            }
-                            catch (Exception e){
-                                
-                            }
+                    script {
+                        def serviceExists = sh(script: "kubectl get svc binarycalculator-service --ignore-not-found", returnStatus: true)
+                        if (serviceExists != 0) {
+                            sh 'kubectl expose deployment binarycalculator-deployment --type=LoadBalancer --name=binarycalculator-service'
                         }
-                        // display the service IP
-                        sh "kubectl get service/binarycalculator-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}'"
                     }
+                    sh "kubectl get service/binarycalculator-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}'"
                 }
             }
         }
